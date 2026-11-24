@@ -1174,7 +1174,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
+                    batch.title_written(dst, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -1198,7 +1198,7 @@ impl HostList {
                 }
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
-                        batch.title_written();
+                        batch.title_written_all();
                     }
                     work();
                     #[cfg(feature = "diagnostics")]
@@ -1242,6 +1242,12 @@ struct Batch {
     textures: std::collections::HashSet<usize>,
 }
 
+/// Whether a write to `[address, address + len)` can change what a copy of
+/// `[from, to)` holds.
+fn overlaps(from: usize, to: usize, address: usize, len: usize) -> bool {
+    from < address.saturating_add(len) && address < to
+}
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
@@ -1261,9 +1267,37 @@ impl Batch {
         self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
-    /// Before a step that writes title memory: pending refreshes are done
-    /// first, and textures are checked again after it.
-    fn title_written(&mut self) {
+    /// Before a step that writes `[address, address + len)` of title memory:
+    /// the pending refreshes of the ranges it touches are done first, and
+    /// textures are checked again after it.
+    ///
+    /// Only the refreshes that overlap the written range are flushed: the
+    /// world's steps interleave thousands of small title copies with views of
+    /// its 174 MB heap, and flushing them all on every copy re-checked that
+    /// heap dozens of times per frame.
+    fn title_written(&mut self, address: usize, len: usize) {
+        let mut i = 0;
+        while i < self.refreshes.len() {
+            let (_, from, to) = &self.refreshes[i];
+            if overlaps(*from, *to, address, len) {
+                let (shadow, from, to) = self.refreshes.remove(i);
+                let started = std::time::Instant::now();
+                let copied = shadow.update(from, to - from);
+                let us = started.elapsed().as_micros() as u64;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(from, to - from, us, 0);
+                PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            } else {
+                i += 1;
+            }
+        }
+        self.textures.clear();
+    }
+
+    /// Before a step that writes title memory somewhere unknown: every
+    /// pending refresh is done first.
+    fn title_written_all(&mut self) {
         self.flush();
         self.textures.clear();
     }
@@ -1989,6 +2023,22 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 
     #[test]
+    fn only_a_write_that_overlaps_a_copy_can_change_it() {
+        use super::overlaps;
+        // A copy of [0x1000, 0x2000).
+        assert!(overlaps(0x1000, 0x2000, 0x1000, 4), "the first byte");
+        assert!(overlaps(0x1000, 0x2000, 0x1ffc, 4), "the last byte");
+        assert!(overlaps(0x1000, 0x2000, 0x0800, 0x1000), "a write reaching in");
+        assert!(overlaps(0x1000, 0x2000, 0x1800, 0x1000), "a write reaching out");
+        assert!(!overlaps(0x1000, 0x2000, 0x0000, 0x1000), "ending where it starts");
+        assert!(!overlaps(0x1000, 0x2000, 0x2000, 0x1000), "starting where it ends");
+        assert!(!overlaps(0x1000, 0x2000, 0x9000, 0x1000), "elsewhere");
+        // A write whose length overflows the address space touches nothing
+        // beyond it (and does not panic).
+        assert!(!overlaps(0x1000, 0x2000, usize::MAX - 1, 8));
+    }
+
+    #[test]
     fn title_writes_make_textures_due_again() {
         let mut batch = Batch::default();
         let a = Arc::new(1u32);
@@ -1996,7 +2046,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(!batch.texture_due(&a));
         // A copy into title memory or work that may write it may have
         // changed the texture's memory.
-        batch.title_written();
+        batch.title_written_all();
         assert!(batch.texture_due(&a));
         assert!(!batch.texture_due(&a));
         // A fresh submission starts over.
